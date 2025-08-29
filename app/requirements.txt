@@ -29,3 +29,5 @@ orjson==3.9.10
 # Additional utilities
 requests==2.31.0
 apscheduler==3.10.1
+python-jose[cryptography]==3.3.0
+cryptography==42.0.5

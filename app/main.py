@@ -3,12 +3,14 @@ Simplified FastAPI application for CVE data
 JSONB-based design for maximum flexibility
 """
 from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date, timedelta
 import logging
 import asyncio
 import os
+import ipaddress
 
 from .database import (
     db_pool, 
@@ -42,6 +44,8 @@ from ingest.runner import run_source
 import asyncio
 import httpx
 
+from .auth import require_auth
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -64,6 +68,79 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# =============================================================================
+# Internal IP allowlist (for non-public endpoints like /admin)
+# Configure with env:
+#   INTERNAL_PROTECTED_PREFIXES: comma-separated list of path prefixes (default: "/admin")
+#   INTERNAL_IP_ALLOWLIST: comma-separated IPv4/IPv6 addresses or CIDR ranges (empty=allow all)
+#   INTERNAL_TRUST_FORWARD_HEADERS: "true" to use X-Forwarded-For/X-Real-IP when behind proxy
+# =============================================================================
+
+_protected_prefixes = [p.strip() for p in os.getenv('INTERNAL_PROTECTED_PREFIXES', '/admin').split(',') if p.strip()]
+_trust_forward = os.getenv('INTERNAL_TRUST_FORWARD_HEADERS', 'false').lower() in ('1', 'true', 't', 'yes', 'y')
+
+_allowlist_raw = [t.strip() for t in os.getenv('INTERNAL_IP_ALLOWLIST', '').split(',') if t.strip()]
+_allowlist_networks: List[ipaddress._BaseNetwork] = []
+for token in _allowlist_raw:
+    try:
+        # Interpret plain IPs as /32 (IPv4) or /128 (IPv6)
+        net = ipaddress.ip_network(token, strict=False)
+        _allowlist_networks.append(net)
+    except Exception:
+        logger.warning("Skipping invalid allowlist entry: %s", token)
+
+
+def _client_ip_from_headers(scope_headers: Dict[str, str]) -> Optional[str]:
+    # Prefer X-Forwarded-For first hop if trusted
+    if _trust_forward:
+        xff = scope_headers.get('x-forwarded-for')
+        if xff:
+            # Take the first IP in the list
+            first = xff.split(',')[0].strip()
+            if first:
+                return first
+        xri = scope_headers.get('x-real-ip')
+        if xri:
+            return xri.strip()
+    return None
+
+
+@app.middleware("http")
+async def internal_ip_allowlist(request, call_next):
+    try:
+        path = request.url.path or "/"
+        protected = any(path.startswith(pref) for pref in _protected_prefixes)
+        if not protected:
+            return await call_next(request)
+
+        # If no allowlist configured, allow all IPs for convenience
+        if not _allowlist_networks:
+            return await call_next(request)
+
+        # Build lowercase header map
+        headers_map = {k.decode('latin-1').lower(): v.decode('latin-1') for k, v in request.scope.get('headers', [])}
+
+        ip_str = _client_ip_from_headers(headers_map) or (request.client.host if request.client else None)
+        if not ip_str:
+            # No client IP, deny
+            return JSONResponse(status_code=403, content={"detail": "IP not allowed"})
+
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except ValueError:
+            logger.warning("Malformed client IP: %s", ip_str)
+            return JSONResponse(status_code=403, content={"detail": "IP not allowed"})
+
+        allowed = any(ip_obj in net for net in _allowlist_networks)
+        if not allowed:
+            logger.info("Blocked IP %s for path %s", ip_str, path)
+            return JSONResponse(status_code=403, content={"detail": "IP not allowed"})
+
+        return await call_next(request)
+    except Exception:
+        logger.exception("IP allowlist middleware error")
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 # =============================================================================
 # Startup and Shutdown Events
@@ -325,7 +402,7 @@ async def get_stats() -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/admin/refresh-view")
-async def refresh_view():
+async def refresh_view(claims = Depends(require_auth(['admin']))):
     """
     Administrative endpoint to refresh the materialized view
     
@@ -349,7 +426,7 @@ async def refresh_view():
 
 
 @app.post("/admin/trigger-ingest")
-async def trigger_ingest(source: str = None, max_cves: int = None):
+async def trigger_ingest(source: str = None, max_cves: int = None, claims = Depends(require_auth(['admin']))):
     """Trigger ingestion for a source (nvd|cisa) or both if omitted.
 
     This endpoint schedules the ingest job in the background and returns
@@ -375,7 +452,7 @@ async def trigger_ingest(source: str = None, max_cves: int = None):
 
 
 @app.get('/admin/ingest-status')
-async def ingest_status():
+async def ingest_status(claims = Depends(require_auth(['admin']))):
     """Return ingest state and last refresh info for cve_overview"""
     try:
         ingest = await get_all_ingest_state()
@@ -387,7 +464,7 @@ async def ingest_status():
 
 
 @app.get('/admin/ingest/status/{source}')
-async def get_source_status(source: str):
+async def get_source_status(source: str, claims = Depends(require_auth(['admin']))):
     """Return 'running' or 'rest' for the given source (nvd|cisa)."""
     if source not in ('nvd', 'cisa'):
         raise HTTPException(status_code=400, detail="source must be 'nvd' or 'cisa'")
@@ -401,7 +478,7 @@ async def get_source_status(source: str):
 
 
 @app.get('/admin/ingest/status')
-async def get_all_sources_status():
+async def get_all_sources_status(claims = Depends(require_auth(['admin']))):
     """Return a summary status for both sources."""
     try:
         nvd_running = await is_source_running('nvd')
@@ -416,7 +493,7 @@ async def get_all_sources_status():
 
 
 @app.get('/admin/crawl-jobs')
-async def crawl_jobs(limit: int = 10):
+async def crawl_jobs(limit: int = 10, claims = Depends(require_auth(['admin']))):
     """Return the latest `limit` persisted crawl runs ordered by started_at desc.
 
     Default limit is 10. This returns data from the `crawl_runs` table.
@@ -432,7 +509,7 @@ async def crawl_jobs(limit: int = 10):
 
 
 @app.get('/admin/last-crawl')
-async def last_crawl():
+async def last_crawl(claims = Depends(require_auth(['admin']))):
     """Return the latest crawl times per source and the last materialized view refresh time.
 
     This provides a concise view for users to know "data up to" timestamps.
@@ -465,7 +542,7 @@ async def last_crawl():
 # -----------------------------------------------------------------------------
 
 @app.get('/admin/fetch-log')
-async def fetch_log(source: Optional[str] = None, limit: int = Query(10, ge=1, le=100)):
+async def fetch_log(source: Optional[str] = None, limit: int = Query(10, ge=1, le=100), claims = Depends(require_auth(['admin']))):
     try:
         logs = await get_fetch_log(source=source, limit=limit)
         return {'status': 'success', 'logs': logs}
@@ -475,7 +552,7 @@ async def fetch_log(source: Optional[str] = None, limit: int = Query(10, ge=1, l
 
 
 @app.get('/admin/staleness')
-async def staleness():
+async def staleness(claims = Depends(require_auth(['admin']))):
     """Return how long the data hasn't updated for each source and the view.
 
     Computes durations since last successful finished_at per source and last_refreshed for the matview.
@@ -513,7 +590,7 @@ async def staleness():
 
 
 @app.post('/admin/schedule-once')
-async def schedule_once(source: str, run_at: Optional[datetime] = None, params: Optional[Dict[str, Any]] = None):
+async def schedule_once(source: str, run_at: Optional[datetime] = None, params: Optional[Dict[str, Any]] = None, claims = Depends(require_auth(['admin']))):
     """Schedule a one-time crawl for a source (nvd|cisa). If run_at is omitted, runs ASAP.
 
     Returns the job id and status.
@@ -530,7 +607,7 @@ async def schedule_once(source: str, run_at: Optional[datetime] = None, params: 
 
 
 @app.post('/admin/cleanup-duplicates')
-async def cleanup_duplicates_endpoint():
+async def cleanup_duplicates_endpoint(claims = Depends(require_auth(['admin']))):
     """Admin endpoint to find and remove duplicate rows across all public tables.
 
     Returns a report per table with counts of duplicate groups and rows removed.
@@ -547,7 +624,7 @@ async def cleanup_duplicates_endpoint():
 # Real-time NVD totalResults check
 # -----------------------------------------------------------------------------
 @app.get('/admin/nvd/total')
-async def nvd_total_results():
+async def nvd_total_results(claims = Depends(require_auth(['admin']))):
     """
     Query NVD's /cves/2.0 endpoint to return the current totalResults reported by NVD.
 
@@ -649,7 +726,7 @@ async def get_kev_cves(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get('/admin/nvd/full-round')
-async def nvd_full_round_status():
+async def nvd_full_round_status(claims = Depends(require_auth(['admin']))):
     """Return whether the scheduled NVD full-round job is enabled."""
     try:
         row = await get_scheduler_flag_row('nvd_full_round_enabled')
@@ -671,7 +748,7 @@ async def nvd_full_round_status():
         raise HTTPException(status_code=500, detail='Failed to read flag')
 
 @app.post('/admin/nvd/full-round/activate')
-async def nvd_full_round_activate(updated_by: Optional[str] = None, reason: Optional[str] = None):
+async def nvd_full_round_activate(updated_by: Optional[str] = None, reason: Optional[str] = None, claims = Depends(require_auth(['admin']))):
     """Activate the scheduled NVD full-round job. Accepts optional audit fields: updated_by, reason."""
     try:
         ok = await set_scheduler_flag('nvd_full_round_enabled', 'true', updated_by=updated_by, updated_reason=reason)
@@ -694,7 +771,7 @@ async def nvd_full_round_activate(updated_by: Optional[str] = None, reason: Opti
         raise HTTPException(status_code=500, detail='Failed to activate')
 
 @app.post('/admin/nvd/full-round/deactivate')
-async def nvd_full_round_deactivate(updated_by: Optional[str] = None, reason: Optional[str] = None):
+async def nvd_full_round_deactivate(updated_by: Optional[str] = None, reason: Optional[str] = None, claims = Depends(require_auth(['admin']))):
     """Deactivate the scheduled NVD full-round job. Accepts optional audit fields: updated_by, reason."""
     try:
         ok = await set_scheduler_flag('nvd_full_round_enabled', 'false', updated_by=updated_by, updated_reason=reason)
@@ -718,7 +795,7 @@ async def nvd_full_round_deactivate(updated_by: Optional[str] = None, reason: Op
 
 
 @app.post('/admin/nvd/full-round/run')
-async def nvd_full_round_run_now(max_cves: Optional[int] = None):
+async def nvd_full_round_run_now(max_cves: Optional[int] = None, claims = Depends(require_auth(['admin']))):
     """Schedule an immediate, ad-hoc full-round paginated NVD crawl with safe swap reconciliation.
 
     This runs in the background and returns immediately with an accepted response.

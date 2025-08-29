@@ -64,19 +64,26 @@ services:
     env_file:
       - .env
     environment:
-      - DATABASE_URL=postgresql://cveuser:cvepass@postgres:5432/cvedb
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_USER=cveuser
-      - POSTGRES_PASSWORD=cvepass
-      - POSTGRES_DB=cvedb
-      - APP_TIMEZONE=Asia/Kuala_Lumpur
-      - TZ=Asia/Kuala_Lumpur
-      # Gap Recovery Configuration
-      - GAP_DETECTION_WINDOW_HOURS=4
-      - MAX_CHUNK_DURATION_HOURS=24
-      - MIN_CHUNK_DURATION_HOURS=6
-      - INGEST_LOG_DIR=/var/log/ingest
+    - DATABASE_URL=postgresql://cveuser:cvepass@postgres:5432/cvedb
+    # Auth service (set AUTH_ISSUER in .env to your auth base URL)
+    - AUTH_ISSUER=${AUTH_ISSUER}
+    - JWT_AUDIENCE=${JWT_AUDIENCE}
+    # IP allowlist for internal endpoints
+    - INTERNAL_PROTECTED_PREFIXES=${INTERNAL_PROTECTED_PREFIXES}
+    - INTERNAL_IP_ALLOWLIST=${INTERNAL_IP_ALLOWLIST}
+    - INTERNAL_TRUST_FORWARD_HEADERS=${INTERNAL_TRUST_FORWARD_HEADERS}
+    - POSTGRES_HOST=postgres
+    - POSTGRES_PORT=5432
+    - POSTGRES_USER=cveuser
+    - POSTGRES_PASSWORD=cvepass
+    - POSTGRES_DB=cvedb
+    - APP_TIMEZONE=Asia/Kuala_Lumpur
+    - TZ=Asia/Kuala_Lumpur
+    # Gap Recovery Configuration
+    - GAP_DETECTION_WINDOW_HOURS=4
+    - MAX_CHUNK_DURATION_HOURS=24
+    - MIN_CHUNK_DURATION_HOURS=6
+    - INGEST_LOG_DIR=/var/log/ingest
     depends_on:
       postgres:
         condition: service_healthy
