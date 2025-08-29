@@ -1,0 +1,168 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cveuser
+      POSTGRES_PASSWORD: cvepass
+      POSTGRES_DB: cvedb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cveuser -d cvedb"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  opensearch:
+    profiles: ["search"]
+    image: opensearchproject/opensearch:2.14.0
+    container_name: opensearch
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=StrongPassw0rd!
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-k", "-u", "admin:StrongPassw0rd!", "https://localhost:9200/_cluster/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  dashboards:
+    profiles: ["search"]
+    image: opensearchproject/opensearch-dashboards:2.14.0
+    container_name: dashboards
+    ports:
+      - "5601:5601"
+    environment:
+      - OPENSEARCH_HOSTS=https://opensearch:9200
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: cve-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://cveuser:cvepass@postgres:5432/cvedb
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=cveuser
+      - POSTGRES_PASSWORD=cvepass
+      - POSTGRES_DB=cvedb
+      - APP_TIMEZONE=Asia/Kuala_Lumpur
+      - TZ=Asia/Kuala_Lumpur
+      # Gap Recovery Configuration
+      - GAP_DETECTION_WINDOW_HOURS=4
+      - MAX_CHUNK_DURATION_HOURS=24
+      - MIN_CHUNK_DURATION_HOURS=6
+      - INGEST_LOG_DIR=/var/log/ingest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # Mount tmp directory for lock file monitoring
+      - lock_data:/tmp
+      - ingest_logs:/var/log/ingest
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  ingest-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest-cron
+    container_name: cve-ingest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://cveuser:cvepass@postgres:5432/cvedb
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=cveuser
+      - POSTGRES_PASSWORD=cvepass
+      - POSTGRES_DB=cvedb
+      - APP_TIMEZONE=Asia/Kuala_Lumpur
+      - TZ=Asia/Kuala_Lumpur
+      # Gap Recovery Configuration
+      - GAP_DETECTION_WINDOW_HOURS=4
+      - MAX_CHUNK_DURATION_HOURS=24
+      - MIN_CHUNK_DURATION_HOURS=6
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ingest_logs:/var/log/ingest
+      # Mount tmp directory for lock file sharing
+      - lock_data:/tmp
+    healthcheck:
+      test: ["CMD", "ps", "aux", "|", "grep", "cron", "||", "exit", "1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+    # Optional: a one-shot trace run service can be started on demand to execute
+    # a full NVD ingest and exit. To run, execute:
+    #   docker-compose run --rm ingest-trace
+    # This service is intentionally not part of `up` by default.
+  ingest-trace:
+    image: cve-ingest:local
+    container_name: ingest-trace
+    entrypoint: ["python", "-u", "-m", "ingest.runner"]
+    command: ["--source", "nvd", "--once"]
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://cveuser:cvepass@postgres:5432/cvedb
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=cveuser
+      - POSTGRES_PASSWORD=cvepass
+      - POSTGRES_DB=cvedb
+      - APP_TIMEZONE=Asia/Kuala_Lumpur
+      - INGEST_LOG_DIR=/var/log/ingest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ingest_logs:/var/log/ingest
+      - lock_data:/tmp
+      
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: tis_pgadmin
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@example.com
+      - PGADMIN_DEFAULT_PASSWORD=admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:
+  opensearch_data:
+  ingest_logs:
+  lock_data:

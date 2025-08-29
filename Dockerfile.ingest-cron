@@ -1,0 +1,41 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    postgresql-client \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install Python dependencies
+COPY app/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application and ingest code
+COPY app/ ./app/
+COPY ingest/ ./ingest/
+
+# Create non-root user
+RUN useradd --create-home --shell /bin/bash ingest_user && \
+    chown -R ingest_user:ingest_user /app && \
+    mkdir -p /var/log/ingest && \
+    chown -R ingest_user:ingest_user /var/log/ingest
+USER ingest_user
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV INGEST_LOG_DIR=/var/log/ingest
+
+# Entrypoint: run ingestion once on container start and then sleep/retry loop
+# This is intentionally simple: the compose healthcheck checks for cron/long-running
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+
+# Do not install su-exec in the image (not available in some distros/archives).
+# The entrypoint will attempt to use su-exec/gosu if present at runtime and
+# otherwise fall back to a su-based exec. We avoid installing extra packages
+# here to keep the image portable.
+
+ENTRYPOINT ["sh", "/usr/local/bin/entrypoint.sh"]
+CMD ["python", "-u", "-m", "ingest.scheduler"]
