@@ -134,28 +134,28 @@ services:
     # a full NVD ingest and exit. To run, execute:
     #   docker-compose run --rm ingest-trace
     # This service is intentionally not part of `up` by default.
-  ingest-trace:
-    image: cve-ingest:local
-    container_name: ingest-trace
-    entrypoint: ["python", "-u", "-m", "ingest.runner"]
-    command: ["--source", "nvd", "--once"]
-    env_file:
-      - .env
-    environment:
-      - DATABASE_URL=postgresql://cveuser:cvepass@postgres:5432/cvedb
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_USER=cveuser
-      - POSTGRES_PASSWORD=cvepass
-      - POSTGRES_DB=cvedb
-      - APP_TIMEZONE=Asia/Kuala_Lumpur
-      - INGEST_LOG_DIR=/var/log/ingest
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ingest_logs:/var/log/ingest
-      - lock_data:/tmp
+  # ingest-trace:
+  #   image: cve-ingest:local
+  #   container_name: ingest-trace
+  #   entrypoint: ["python", "-u", "-m", "ingest.runner"]
+  #   command: ["--source", "nvd", "--once"]
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - DATABASE_URL=postgresql://cveuser:cvepass@postgres:5432/cvedb
+  #     - POSTGRES_HOST=postgres
+  #     - POSTGRES_PORT=5432
+  #     - POSTGRES_USER=cveuser
+  #     - POSTGRES_PASSWORD=cvepass
+  #     - POSTGRES_DB=cvedb
+  #     - APP_TIMEZONE=Asia/Kuala_Lumpur
+  #     - INGEST_LOG_DIR=/var/log/ingest
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   volumes:
+  #     - ingest_logs:/var/log/ingest
+  #     - lock_data:/tmp
       
   pgadmin:
     image: dpage/pgadmin4:latest
