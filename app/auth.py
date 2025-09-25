@@ -19,7 +19,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import Header, HTTPException
+from fastapi import Header, HTTPException, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt
 from jose.utils import base64url_decode
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -30,6 +31,9 @@ AUTH_ISSUER = os.getenv('AUTH_ISSUER', 'http://localhost:8001').rstrip('/')
 JWT_AUDIENCE = os.getenv('JWT_AUDIENCE')  # optional
 JWKS_URL = os.getenv('AUTH_JWKS_URL') or f"{AUTH_ISSUER}/.well-known/jwks.json"
 ALGO = 'RS256'
+
+# Expose a Bearer security scheme so Swagger UI shows the Authorize button
+_bearer_scheme = HTTPBearer(auto_error=False)
 
 
 class _JWKSCache:
@@ -118,10 +122,17 @@ async def verify_token(token: str) -> Dict[str, Any]:
 def require_auth(roles: Optional[List[str]] = None):
     roles = roles or []
 
-    async def _dep(authorization: str | None = Header(default=None)):
-        if not authorization or not authorization.startswith('Bearer '):
+    async def _dep(
+        authorization: str | None = Header(default=None),
+        credentials: Optional[HTTPAuthorizationCredentials] = Security(_bearer_scheme)
+    ):
+        token: Optional[str] = None
+        if credentials and credentials.scheme and credentials.scheme.lower() == 'bearer' and credentials.credentials:
+            token = credentials.credentials
+        elif authorization and authorization.startswith('Bearer '):
+            token = authorization.split(' ', 1)[1]
+        if not token:
             raise HTTPException(status_code=401, detail='Missing token')
-        token = authorization.split(' ', 1)[1]
         claims = await verify_token(token)
         if roles:
             user_roles = set(claims.get('roles', []))

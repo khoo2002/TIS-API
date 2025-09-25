@@ -17,8 +17,10 @@ from .database import (
     get_nvd_cve, 
     search_cves, 
     get_database_stats,
+    get_dashboard_stats,
     refresh_materialized_view,
     ensure_cve_overview_structure,
+    ensure_editorial_structure,
     get_last_successful_finish_at,
     get_last_attempt_at,
     get_fetch_log,
@@ -26,11 +28,36 @@ from .database import (
     create_one_time_job,
     get_due_one_time_jobs,
     mark_job_started,
-    mark_job_finished
+    mark_job_finished,
+    ensure_user_profiles_structure,
+    upsert_user_profile,
+    get_user_profile,
+    list_user_profiles,
+    delete_user_profile,
 )
 from .database import get_cve_overview_total
 # additional imports
 from .database import get_all_ingest_state, get_refresh_state
+from .database import (
+    upsert_cve_curation,
+    get_curation,
+    list_curations,
+    set_curation_publish_state,
+    delete_curation,
+    create_alert,
+    update_alert,
+    get_alert_by_id_or_slug,
+    list_alerts_admin,
+    set_alert_publish_state,
+    delete_alert,
+    public_get_alert_by_slug,
+    public_list_alerts,
+    public_get_curated_cve,
+    admin_get_curated_cve,
+    public_list_cves,
+    refresh_cve_public_overview,
+    refresh_alerts_public,
+)
 from .database import is_source_running
 from .database import cleanup_duplicates
 from .database import get_scheduler_flag, set_scheduler_flag, get_scheduler_flag_row
@@ -158,6 +185,10 @@ async def startup_event():
             try:
                 logger.info("Ensuring cve_overview structure (background)...")
                 await ensure_cve_overview_structure()
+                logger.info("Ensuring editorial structure (background)...")
+                await ensure_editorial_structure()
+                logger.info("Ensuring user_profiles structure (background)...")
+                await ensure_user_profiles_structure()
             except Exception:
                 logger.exception('Background ensure_cve_overview_structure failed')
             # try a refresh a bit later; retry lightly if DB is busy
@@ -219,6 +250,30 @@ async def startup_event():
         logger.error(f"Startup failed: {e}")
         # Don't raise on startup failure, just log it
         # This allows the health endpoint to work even if DB is down
+@app.get('/admin/users', dependencies=[Depends(require_auth(['admin']))])
+async def admin_list_users(q: str = None, limit: int = 50, offset: int = 0):
+    return await list_user_profiles(limit=limit, offset=offset, q=q)
+
+@app.get('/admin/users/{user_id}', dependencies=[Depends(require_auth(['admin']))])
+async def admin_get_user(user_id: str):
+    prof = await get_user_profile(user_id)
+    if not prof:
+        raise HTTPException(status_code=404, detail='User not found')
+    return prof
+
+@app.post('/admin/users', dependencies=[Depends(require_auth(['admin']))])
+async def admin_create_or_update_user(payload: Dict[str, Any]):
+    user_id = payload.get('user_id')
+    if not user_id:
+        raise HTTPException(status_code=400, detail='user_id is required')
+    return await upsert_user_profile(user_id=user_id, email=payload.get('email'), gemini_apikey=payload.get('gemini_apikey'))
+
+@app.delete('/admin/users/{user_id}', dependencies=[Depends(require_auth(['admin']))])
+async def admin_delete_user(user_id: str):
+    ok = await delete_user_profile(user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail='User not found')
+    return {"ok": True}
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -400,6 +455,46 @@ async def get_stats() -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/admin/dashboard/stats")
+async def get_admin_dashboard_statistics(claims = Depends(require_auth(['admin','editor','reviewer','publisher']))) -> Dict[str, Any]:
+    """
+    Get comprehensive admin dashboard statistics
+    
+    Returns:
+        Dashboard metrics including totals, severity distribution, recent CVEs, and editorial workflow stats
+    """
+    try:
+        stats = await get_dashboard_stats()
+        
+        # Add admin-specific stats
+        async with db_pool.get_connection() as conn:
+            # Draft/review counts
+            draft_curations = await conn.fetchval(
+                "SELECT COUNT(*) FROM cve_curations WHERE COALESCE(curation_status, status) = 'draft'"
+            )
+            review_curations = await conn.fetchval(
+                "SELECT COUNT(*) FROM cve_curations WHERE COALESCE(curation_status, status) = 'review'"
+            )
+            draft_alerts = await conn.fetchval(
+                "SELECT COUNT(*) FROM alerts WHERE status = 'draft'"
+            )
+            review_alerts = await conn.fetchval(
+                "SELECT COUNT(*) FROM alerts WHERE status = 'review'"
+            )
+            
+            # Add to existing stats
+            stats['totals']['draft_curations'] = draft_curations
+            stats['totals']['review_curations'] = review_curations
+            stats['totals']['draft_alerts'] = draft_alerts
+            stats['totals']['review_alerts'] = review_alerts
+            
+        return stats
+    except Exception as e:
+        logger.error(f"Error getting admin dashboard stats: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 
 @app.post("/admin/refresh-view")
 async def refresh_view(claims = Depends(require_auth(['admin']))):
@@ -869,6 +964,196 @@ async def get_recent_cves(
     except Exception as e:
         logger.error(f"Error getting recent CVEs: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+# =============================================================================
+# Admin Editorial Endpoints (protected)
+# =============================================================================
+
+@app.post('/admin/curations')
+async def admin_upsert_curation(payload: Dict[str, Any], claims = Depends(require_auth(['admin','editor']))):
+    actor = claims.get('sub')
+    if not payload.get('cve_id') or not payload.get('title'):
+        raise HTTPException(status_code=400, detail='cve_id and title are required')
+    try:
+        out = await upsert_cve_curation(payload['cve_id'], payload, actor)
+        return {'status': 'success', 'curation': out}
+    except Exception:
+        logger.exception('admin_upsert_curation failed')
+        raise HTTPException(status_code=500, detail='Failed to upsert curation')
+
+
+@app.get('/admin/curations/{cve_id}')
+async def admin_get_curation(cve_id: str, claims = Depends(require_auth(['admin','editor','reviewer','publisher']))):
+    cur = await get_curation(cve_id)
+    if not cur:
+        raise HTTPException(status_code=404, detail='Not found')
+    return {'status': 'success', 'curation': cur}
+
+
+@app.get('/admin/curations/{cve_id}/full')
+async def admin_get_curation_full(cve_id: str, claims = Depends(require_auth(['admin','editor','reviewer','publisher']))):
+    """Get comprehensive CVE data including original NVD data, curated overrides, and all metadata for editing."""
+    cur = await admin_get_curated_cve(cve_id)
+    if not cur:
+        raise HTTPException(status_code=404, detail='CVE not found')
+    return {'status': 'success', 'curation': cur}
+
+
+@app.get('/admin/curations')
+async def admin_list_curations(status: Optional[str] = None, q: Optional[str] = None, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), claims = Depends(require_auth(['admin','editor','reviewer','publisher']))):
+    return await list_curations(status, q, limit, offset)
+
+
+@app.post('/admin/curations/{cve_id}/publish')
+async def admin_publish_curation(cve_id: str, claims = Depends(require_auth(['admin','publisher']))):
+    ok = await set_curation_publish_state(cve_id, True, claims.get('sub'))
+    if not ok:
+        raise HTTPException(status_code=400, detail='Publish failed')
+    await refresh_cve_public_overview()
+    return {'status': 'published'}
+
+
+@app.post('/admin/curations/{cve_id}/unpublish')
+async def admin_unpublish_curation(cve_id: str, claims = Depends(require_auth(['admin','publisher']))):
+    ok = await set_curation_publish_state(cve_id, False, claims.get('sub'))
+    if not ok:
+        raise HTTPException(status_code=400, detail='Unpublish failed')
+    await refresh_cve_public_overview()
+    return {'status': 'unpublished'}
+
+
+@app.delete('/admin/curations/{cve_id}')
+async def admin_delete_curation(cve_id: str, claims = Depends(require_auth(['admin']))):
+    """Delete a curation and its version history."""
+    ok = await delete_curation(cve_id, claims.get('sub'))
+    if not ok:
+        raise HTTPException(status_code=404, detail='Curation not found or delete failed')
+    await refresh_cve_public_overview()
+    return {'status': 'deleted'}
+
+
+@app.get('/admin/curations/{cve_id}/status')
+async def admin_get_curation_status(cve_id: str, claims = Depends(require_auth(['admin','editor','reviewer','publisher']))):
+    """Get just the status and basic metadata of a curation."""
+    cur = await get_curation(cve_id)
+    if not cur:
+        raise HTTPException(status_code=404, detail='Curation not found')
+    
+    # Return minimal status info
+    return {
+        'status': 'success',
+        'curation_status': cur.get('curation_status'),
+        'status': cur.get('status'),
+        'source_status': cur.get('source_status'),
+        'published_at': cur.get('published_at'),
+        'updated_at': cur.get('updated_at'),
+        'updated_by': cur.get('updated_by')
+    }
+
+
+@app.post('/admin/alerts')
+async def admin_create_alert(payload: Dict[str, Any], claims = Depends(require_auth(['admin','editor']))):
+    required = ('slug','title','body_md','severity')
+    if any(not payload.get(k) for k in required):
+        raise HTTPException(status_code=400, detail=f"Missing required fields: {', '.join(required)}")
+    out = await create_alert(payload, claims.get('sub'))
+    return {'status': 'success', 'alert': out}
+
+
+@app.put('/admin/alerts/{id_or_slug}')
+async def admin_update_alert(id_or_slug: str, payload: Dict[str, Any], claims = Depends(require_auth(['admin','editor']))):
+    out = await update_alert(id_or_slug, payload, claims.get('sub'))
+    if not out:
+        raise HTTPException(status_code=404, detail='Not found')
+    return {'status': 'success', 'alert': out}
+
+
+@app.get('/admin/alerts/{id_or_slug}')
+async def admin_get_alert(id_or_slug: str, claims = Depends(require_auth(['admin','editor','reviewer','publisher']))):
+    out = await get_alert_by_id_or_slug(id_or_slug)
+    if not out:
+        raise HTTPException(status_code=404, detail='Not found')
+    return {'status': 'success', 'alert': out}
+
+
+@app.get('/admin/alerts')
+async def admin_list_alerts(status: Optional[str] = None, q: Optional[str] = None, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), claims = Depends(require_auth(['admin','editor','reviewer','publisher']))):
+    return await list_alerts_admin(status, q, limit, offset)
+
+
+@app.post('/admin/alerts/{id_or_slug}/publish')
+async def admin_publish_alert(id_or_slug: str, claims = Depends(require_auth(['admin','publisher']))):
+    ok = await set_alert_publish_state(id_or_slug, True, claims.get('sub'))
+    if not ok:
+        raise HTTPException(status_code=400, detail='Publish failed')
+    await refresh_alerts_public()
+    return {'status': 'published'}
+
+
+@app.post('/admin/alerts/{id_or_slug}/unpublish')
+async def admin_unpublish_alert(id_or_slug: str, claims = Depends(require_auth(['admin','publisher']))):
+    ok = await set_alert_publish_state(id_or_slug, False, claims.get('sub'))
+    if not ok:
+        raise HTTPException(status_code=400, detail='Unpublish failed')
+    await refresh_alerts_public()
+    return {'status': 'unpublished'}
+
+
+@app.delete('/admin/alerts/{id_or_slug}')
+async def admin_delete_alert(id_or_slug: str, claims = Depends(require_auth(['admin']))):
+    """Delete an alert by ID or slug."""
+    ok = await delete_alert(id_or_slug, claims.get('sub'))
+    if not ok:
+        raise HTTPException(status_code=404, detail='Alert not found or delete failed')
+    await refresh_alerts_public()
+    return {'status': 'deleted'}
+
+
+@app.get('/admin/alerts/{id_or_slug}/status')
+async def admin_get_alert_status(id_or_slug: str, claims = Depends(require_auth(['admin','editor','reviewer','publisher']))):
+    """Get just the status and basic metadata of an alert."""
+    alert = await get_alert_by_id_or_slug(id_or_slug)
+    if not alert:
+        raise HTTPException(status_code=404, detail='Alert not found')
+    
+    # Return minimal status info
+    return {
+        'status': 'success',
+        'alert_status': alert.get('status'),
+        'published_at': alert.get('published_at'),
+        'updated_at': alert.get('updated_at'),
+        'updated_by': alert.get('updated_by')
+    }
+
+
+# =============================================================================
+# Public Read-only Endpoints
+# =============================================================================
+
+@app.get('/public/alerts')
+async def public_alerts(q: Optional[str] = None, severity: Optional[str] = None, category: Optional[str] = None, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
+    return await public_list_alerts(q, severity, category, limit, offset)
+
+
+@app.get('/public/alert/{slug}')
+async def public_alert(slug: str):
+    out = await public_get_alert_by_slug(slug)
+    if not out:
+        raise HTTPException(status_code=404, detail='Not found')
+    return out
+
+
+@app.get('/public/cves')
+async def public_cves(q: Optional[str] = None, severity: Optional[str] = None, has_kev: Optional[bool] = None, tag: Optional[str] = None, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
+    return await public_list_cves(q, severity, has_kev, tag, limit, offset)
+
+
+@app.get('/public/cve/{cve_id}')
+async def public_cve(cve_id: str):
+    out = await public_get_curated_cve(cve_id)
+    if not out:
+        raise HTTPException(status_code=404, detail='Not found')
+    return out
 
 if __name__ == "__main__":
     import uvicorn

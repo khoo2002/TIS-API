@@ -266,11 +266,11 @@ async def ensure_cve_overview_structure() -> None:
             await conn.execute("REFRESH MATERIALIZED VIEW cve_overview_new;")
             # Swap into place
             if exists:
-                await conn.execute("DROP MATERIALIZED VIEW IF EXISTS cve_overview_old;")
+                await conn.execute("DROP MATERIALIZED VIEW IF EXISTS cve_overview_old CASCADE;")
                 await conn.execute("ALTER MATERIALIZED VIEW IF EXISTS cve_overview RENAME TO cve_overview_old;")
             await conn.execute("ALTER MATERIALIZED VIEW cve_overview_new RENAME TO cve_overview;")
             # Drop old after swap
-            await conn.execute("DROP MATERIALIZED VIEW IF EXISTS cve_overview_old;")
+            await conn.execute("DROP MATERIALIZED VIEW IF EXISTS cve_overview_old CASCADE;")
 
         # Ensure required indexes exist on the current view as well (idempotent)
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_cve_overview_cve_id ON cve_overview (cve_id);")
@@ -306,6 +306,1071 @@ async def ensure_cve_overview_structure() -> None:
             await conn.execute('SELECT pg_advisory_unlock($1)', _lock_key)
         except Exception:
             logger.exception('Failed to release advisory lock for ensure_cve_overview')
+
+
+# =============================================================================
+# Editorial: Curations (CVE) and Alerts (non-CVE) + Public Views
+# =============================================================================
+
+async def ensure_editorial_structure() -> None:
+        """Create editorial tables and public materialized views if missing.
+
+        Idempotent and safe to call at startup. Mirrors the style of ensure_cve_overview_structure.
+        """
+        _require_asyncpg()
+        async with db_pool.get_connection() as conn:
+                # Advisory lock to avoid concurrent DDL
+                _lock_key = int.from_bytes(hashlib.sha256(b'ensure_editorial_structure').digest()[:8], 'big') % (2**63 - 1)
+                try:
+                        _got_lock = await conn.fetchval('SELECT pg_try_advisory_lock($1)', _lock_key)
+                except Exception:
+                        logger.exception('Failed to attempt advisory lock for ensure_editorial_structure')
+                        _got_lock = False
+                if not _got_lock:
+                        logger.info('ensure_editorial_structure: another process holds the advisory lock; skipping this run')
+                        return
+
+                # Core tables
+                await conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS cve_curations (
+                            cve_id TEXT PRIMARY KEY,
+                          status TEXT NOT NULL CHECK (status IN ('draft','review','published','archived')),
+                          curation_status TEXT NOT NULL DEFAULT 'draft' CHECK (curation_status IN ('draft','review','published','archived')),
+                          source_status TEXT,
+                            title TEXT NOT NULL,
+                            summary TEXT,
+                            body_md TEXT,
+                            tags JSONB DEFAULT '[]'::jsonb,
+                            "references" JSONB DEFAULT '[]'::jsonb,
+                      curated_patch JSONB DEFAULT '{}'::jsonb,
+                            extras JSONB DEFAULT '{}'::jsonb,
+                            public_extras JSONB DEFAULT '{}'::jsonb,
+                            created_by TEXT,
+                            updated_by TEXT,
+                            created_at TIMESTAMPTZ DEFAULT now(),
+                            updated_at TIMESTAMPTZ DEFAULT now(),
+                            published_at TIMESTAMPTZ
+                        );
+                        """
+                )
+                # Backward-compatible column adds
+                await conn.execute("ALTER TABLE cve_curations ADD COLUMN IF NOT EXISTS extras JSONB DEFAULT '{}'::jsonb;")
+                await conn.execute("ALTER TABLE cve_curations ADD COLUMN IF NOT EXISTS public_extras JSONB DEFAULT '{}'::jsonb;")
+                await conn.execute("ALTER TABLE cve_curations ADD COLUMN IF NOT EXISTS curation_status TEXT DEFAULT 'draft';")
+                await conn.execute("ALTER TABLE cve_curations ADD COLUMN IF NOT EXISTS source_status TEXT;")
+                await conn.execute("ALTER TABLE cve_curations ADD COLUMN IF NOT EXISTS curated_patch JSONB DEFAULT '{}'::jsonb;")
+                await conn.execute("UPDATE cve_curations SET curation_status = status WHERE curation_status IS NULL;")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_cve_curations_curation_status ON cve_curations(curation_status);")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_cve_curations_curated_patch_gin ON cve_curations USING gin (curated_patch);")
+                await conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS cve_curation_versions (
+                            id BIGSERIAL PRIMARY KEY,
+                            cve_id TEXT NOT NULL,
+                            version_no INTEGER NOT NULL,
+                            snapshot JSONB NOT NULL,
+                            edited_by TEXT,
+                            edited_at TIMESTAMPTZ DEFAULT now()
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_cve_curation_versions_cve ON cve_curation_versions(cve_id);
+                        """
+                )
+                await conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS alerts (
+                            id UUID PRIMARY KEY,
+                            slug TEXT UNIQUE NOT NULL,
+                            status TEXT NOT NULL CHECK (status IN ('draft','review','published','archived')),
+                            title TEXT NOT NULL,
+                            body_md TEXT NOT NULL,
+                            severity TEXT NOT NULL CHECK (severity IN ('info','medium','high','critical')),
+                            categories JSONB DEFAULT '[]'::jsonb,
+                            "references" JSONB DEFAULT '[]'::jsonb,
+                            extras JSONB DEFAULT '{}'::jsonb,
+                            public_extras JSONB DEFAULT '{}'::jsonb,
+                            created_by TEXT,
+                            updated_by TEXT,
+                            created_at TIMESTAMPTZ DEFAULT now(),
+                            updated_at TIMESTAMPTZ DEFAULT now(),
+                            published_at TIMESTAMPTZ
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
+                        CREATE INDEX IF NOT EXISTS idx_alerts_published_at ON alerts(published_at);
+                        CREATE INDEX IF NOT EXISTS idx_alerts_categories_gin ON alerts USING gin (categories);
+                        """
+                )
+                await conn.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS extras JSONB DEFAULT '{}'::jsonb;")
+                await conn.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS public_extras JSONB DEFAULT '{}'::jsonb;")
+                # Optional JSONB GIN indexes for flexible querying
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_cve_curations_extras_gin ON cve_curations USING gin (extras);")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_extras_gin ON alerts USING gin (extras);")
+                await conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS publish_events (
+                            id BIGSERIAL PRIMARY KEY,
+                            content_type TEXT NOT NULL CHECK (content_type IN ('curation','alert')),
+                            ref_id TEXT NOT NULL,
+                            action TEXT NOT NULL CHECK (action IN ('publish','unpublish','delete')),
+                            actor TEXT,
+                            at TIMESTAMPTZ DEFAULT now()
+                        );
+                        """
+                )
+
+                # Update existing constraint to allow 'delete' action if needed
+                try:
+                    await conn.execute(
+                        "ALTER TABLE publish_events DROP CONSTRAINT IF EXISTS publish_events_action_check"
+                    )
+                    await conn.execute(
+                        "ALTER TABLE publish_events ADD CONSTRAINT publish_events_action_check CHECK (action IN ('publish','unpublish','delete'))"
+                    )
+                except Exception:
+                    logger.exception('Failed to update publish_events constraint - continuing anyway')
+
+                # Ensure refresh_state rows exist
+                await conn.execute(
+                        """
+                        INSERT INTO refresh_state(name, last_refreshed) VALUES
+                            ('cve_public_overview', NULL)
+                        ON CONFLICT (name) DO NOTHING;
+                        INSERT INTO refresh_state(name, last_refreshed) VALUES
+                            ('alerts_public', NULL)
+                        ON CONFLICT (name) DO NOTHING;
+                        """
+                )
+
+                # Public matviews (minimal fields, derived from curated/published only)
+                await conn.execute("DROP MATERIALIZED VIEW IF EXISTS cve_public_overview_new;")
+                await conn.execute(
+                                                """
+                                                CREATE MATERIALIZED VIEW IF NOT EXISTS cve_public_overview_new AS
+                                                SELECT 
+                                                        o.cve_id,
+                                                        c.title AS curated_title,
+                                                        c.summary AS curated_summary,
+                                                        c.body_md AS curated_body_md,
+                                                        c.tags,
+                            c."references",
+                                                        c.public_extras,
+                                                        c.published_at,
+                                                        o.published AS cve_published,
+                                                        /* Derive CVSS v4.x score/severity preferring curated_patch arrays with keys like cvssMetricV4* */
+                                                        COALESCE(
+                                                                (
+                                                                    SELECT MAX(NULLIF(elem->'cvssData'->>'baseScore','')::float)
+                                                                    FROM jsonb_each(COALESCE(c.curated_patch->'cve'->'metrics','{}'::jsonb)) m(key, val)
+                                                                    JOIN LATERAL jsonb_array_elements(val) elem ON true
+                                                                    WHERE key LIKE 'cvssMetricV4%'
+                                                                ),
+                                                                o.cvss_v40_score
+                                                        ) AS cvss_v40_score,
+                                                        COALESCE(
+                                                                (
+                                                                    SELECT elem->'cvssData'->>'baseSeverity'
+                                                                    FROM jsonb_each(COALESCE(c.curated_patch->'cve'->'metrics','{}'::jsonb)) m(key, val)
+                                                                    JOIN LATERAL jsonb_array_elements(val) elem ON true
+                                                                    WHERE key LIKE 'cvssMetricV4%'
+                                                                    ORDER BY NULLIF(elem->'cvssData'->>'baseScore','')::float DESC NULLS LAST
+                                                                    LIMIT 1
+                                                                ),
+                                                                o.cvss_v40_severity
+                                                        ) AS cvss_v40_severity,
+                                                        /* Derive CVSS v3.x score/severity preferring curated_patch arrays with keys like cvssMetricV3* */
+                                                        COALESCE(
+                                                                (
+                                                                    SELECT MAX(NULLIF(elem->'cvssData'->>'baseScore','')::float)
+                                                                    FROM jsonb_each(COALESCE(c.curated_patch->'cve'->'metrics','{}'::jsonb)) m(key, val)
+                                                                    JOIN LATERAL jsonb_array_elements(val) elem ON true
+                                                                    WHERE key LIKE 'cvssMetricV3%'
+                                                                ),
+                                                                o.cvss_v31_score
+                                                        ) AS cvss_v31_score,
+                                                        COALESCE(
+                                                                (
+                                                                    SELECT elem->'cvssData'->>'baseSeverity'
+                                                                    FROM jsonb_each(COALESCE(c.curated_patch->'cve'->'metrics','{}'::jsonb)) m(key, val)
+                                                                    JOIN LATERAL jsonb_array_elements(val) elem ON true
+                                                                    WHERE key LIKE 'cvssMetricV3%'
+                                                                    ORDER BY NULLIF(elem->'cvssData'->>'baseScore','')::float DESC NULLS LAST
+                                                                    LIMIT 1
+                                                                ),
+                                                                o.cvss_v31_severity
+                                                        ) AS cvss_v31_severity,
+                                                        /* Preferred roll-up across curated v4*, curated v3*, then source v4/v3.1/v3.0/v2 */
+                                                        COALESCE(
+                                                                (
+                                                                    SELECT MAX(NULLIF(elem->'cvssData'->>'baseScore','')::float)
+                                                                    FROM jsonb_each(COALESCE(c.curated_patch->'cve'->'metrics','{}'::jsonb)) m(key, val)
+                                                                    JOIN LATERAL jsonb_array_elements(val) elem ON true
+                                                                    WHERE key LIKE 'cvssMetricV4%'
+                                                                ),
+                                                                (
+                                                                    SELECT MAX(NULLIF(elem->'cvssData'->>'baseScore','')::float)
+                                                                    FROM jsonb_each(COALESCE(c.curated_patch->'cve'->'metrics','{}'::jsonb)) m(key, val)
+                                                                    JOIN LATERAL jsonb_array_elements(val) elem ON true
+                                                                    WHERE key LIKE 'cvssMetricV3%'
+                                                                ),
+                                                                o.cvss_v40_score,
+                                                                o.cvss_v31_score,
+                                                                o.cvss_v30_score,
+                                                                o.cvss_v2_score
+                                                        ) AS cvss_score,
+                                                        COALESCE(
+                                                                (
+                                                                    SELECT elem->'cvssData'->>'baseSeverity'
+                                                                    FROM jsonb_each(COALESCE(c.curated_patch->'cve'->'metrics','{}'::jsonb)) m(key, val)
+                                                                    JOIN LATERAL jsonb_array_elements(val) elem ON true
+                                                                    WHERE key LIKE 'cvssMetricV4%'
+                                                                    ORDER BY NULLIF(elem->'cvssData'->>'baseScore','')::float DESC NULLS LAST
+                                                                    LIMIT 1
+                                                                ),
+                                                                (
+                                                                    SELECT elem->'cvssData'->>'baseSeverity'
+                                                                    FROM jsonb_each(COALESCE(c.curated_patch->'cve'->'metrics','{}'::jsonb)) m(key, val)
+                                                                    JOIN LATERAL jsonb_array_elements(val) elem ON true
+                                                                    WHERE key LIKE 'cvssMetricV3%'
+                                                                    ORDER BY NULLIF(elem->'cvssData'->>'baseScore','')::float DESC NULLS LAST
+                                                                    LIMIT 1
+                                                                ),
+                                                                o.cvss_v40_severity,
+                                                                o.cvss_v31_severity,
+                                                                o.cvss_v30_severity
+                                                        ) AS cvss_severity,
+                                                        o.is_kev
+                                                FROM cve_curations c
+                                                JOIN cve_overview o ON o.cve_id = c.cve_id
+                                                WHERE COALESCE(c.curation_status, c.status) = 'published'
+                                                WITH NO DATA;
+                                                """
+                                )
+                await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_cve_public_overview_new_cve_id ON cve_public_overview_new(cve_id);")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_cve_public_overview_published_at ON cve_public_overview_new(published_at);")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_cve_public_overview_cvss_severity ON cve_public_overview_new(cvss_severity);")
+
+                await conn.execute("DROP MATERIALIZED VIEW IF EXISTS alerts_public_new;")
+                await conn.execute(
+                        """
+                        CREATE MATERIALIZED VIEW IF NOT EXISTS alerts_public_new AS
+                        SELECT 
+                            id,
+                            slug,
+                            title,
+                            body_md,
+                            severity,
+                            categories,
+                            "references",
+                            public_extras,
+                            published_at
+                        FROM alerts
+                        WHERE status = 'published'
+                        WITH NO DATA;
+                        """
+                )
+                await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_alerts_public_new_slug ON alerts_public_new(slug);")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_public_new_published_at ON alerts_public_new(published_at);")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_public_new_severity ON alerts_public_new(severity);")
+
+                # Populate and swap into place
+                await conn.execute("REFRESH MATERIALIZED VIEW cve_public_overview_new;")
+                await conn.execute("REFRESH MATERIALIZED VIEW alerts_public_new;")
+                await conn.execute("DROP MATERIALIZED VIEW IF EXISTS cve_public_overview_old;")
+                await conn.execute("DROP MATERIALIZED VIEW IF EXISTS alerts_public_old;")
+                exists_cve_pub = await conn.fetchval("SELECT 1 FROM pg_matviews WHERE matviewname='cve_public_overview'")
+                if exists_cve_pub:
+                        await conn.execute("ALTER MATERIALIZED VIEW cve_public_overview RENAME TO cve_public_overview_old;")
+                await conn.execute("ALTER MATERIALIZED VIEW cve_public_overview_new RENAME TO cve_public_overview;")
+                exists_alerts_pub = await conn.fetchval("SELECT 1 FROM pg_matviews WHERE matviewname='alerts_public'")
+                if exists_alerts_pub:
+                        await conn.execute("ALTER MATERIALIZED VIEW alerts_public RENAME TO alerts_public_old;")
+                await conn.execute("ALTER MATERIALIZED VIEW alerts_public_new RENAME TO alerts_public;")
+                await conn.execute("DROP MATERIALIZED VIEW IF EXISTS cve_public_overview_old;")
+                await conn.execute("DROP MATERIALIZED VIEW IF EXISTS alerts_public_old;")
+
+                # Ensure current view indexes
+                await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_cve_public_overview_cve_id ON cve_public_overview(cve_id);")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_cve_public_overview_cvss_severity ON cve_public_overview(cvss_severity);")
+                await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_alerts_public_slug ON alerts_public(slug);")
+
+                try:
+                        await conn.execute('SELECT pg_advisory_unlock($1)', _lock_key)
+                except Exception:
+                        logger.exception('Failed to release advisory lock for ensure_editorial_structure')
+
+
+async def refresh_cve_public_overview(retries: int = 2) -> bool:
+    attempt = 0
+    delay_seq = [2, 5, 10]
+    while True:
+        attempt += 1
+        try:
+            async with db_pool.get_connection() as conn:
+                try:
+                    await conn.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY cve_public_overview")
+                    try:
+                        await _update_refresh_state('cve_public_overview')
+                    except Exception:
+                        logger.exception('Failed updating refresh_state for cve_public_overview')
+                    return True
+                except Exception as e:
+                    logger.warning("cve_public_overview refresh attempt %d failed: %s", attempt, e)
+        except Exception as e:
+            logger.warning("cve_public_overview refresh conn error attempt %d: %s", attempt, e)
+        if attempt > max(1, retries):
+            return False
+        await asyncio.sleep(delay_seq[min(attempt-1, len(delay_seq)-1)])
+
+
+async def refresh_alerts_public(retries: int = 2) -> bool:
+    attempt = 0
+    delay_seq = [2, 5, 10]
+    while True:
+        attempt += 1
+        try:
+            async with db_pool.get_connection() as conn:
+                try:
+                    await conn.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY alerts_public")
+                    try:
+                        await _update_refresh_state('alerts_public')
+                    except Exception:
+                        logger.exception('Failed updating refresh_state for alerts_public')
+                    return True
+                except Exception as e:
+                    logger.warning("alerts_public refresh attempt %d failed: %s", attempt, e)
+        except Exception as e:
+            logger.warning("alerts_public refresh conn error attempt %d: %s", attempt, e)
+        if attempt > max(1, retries):
+            return False
+
+        await asyncio.sleep(delay_seq[min(attempt-1, len(delay_seq)-1)])
+
+
+# ------------------------------- Users (admin) ------------------------------
+
+async def ensure_user_profiles_structure() -> None:
+    """Ensure user_profiles table exists with required indexes."""
+    _require_asyncpg()
+    try:
+        async with db_pool.get_connection() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    user_id TEXT PRIMARY KEY,
+                    email TEXT UNIQUE,
+                    gemini_apikey TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE OR REPLACE FUNCTION set_updated_at()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                  NEW.updated_at = NOW();
+                  RETURN NEW;
+                END;$$ LANGUAGE plpgsql;
+                CREATE OR REPLACE TRIGGER user_profiles_set_updated
+                BEFORE UPDATE ON user_profiles
+                FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+                """
+            )
+    except Exception:
+        logger.exception('ensure_user_profiles_structure failed')
+
+
+async def upsert_user_profile(user_id: str, email: Optional[str], gemini_apikey: Optional[str]) -> Dict[str, Any]:
+    try:
+        async with db_pool.get_connection() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_profiles (user_id, email, gemini_apikey)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id)
+                DO UPDATE SET email = EXCLUDED.email, gemini_apikey = EXCLUDED.gemini_apikey
+                RETURNING user_id, email, gemini_apikey, created_at, updated_at
+                """,
+                user_id, email, gemini_apikey
+            )
+            return dict(row) if row else {}
+    except Exception:
+        logger.exception('upsert_user_profile failed')
+        raise
+
+
+async def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        async with db_pool.get_connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT user_id, email, gemini_apikey, created_at, updated_at FROM user_profiles WHERE user_id=$1",
+                user_id
+            )
+            return dict(row) if row else None
+    except Exception:
+        logger.exception('get_user_profile failed')
+        raise
+
+
+async def list_user_profiles(limit: int = 50, offset: int = 0, q: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        async with db_pool.get_connection() as conn:
+            if q:
+                rows = await conn.fetch(
+                    """
+                    SELECT user_id, email, gemini_apikey, created_at, updated_at
+                    FROM user_profiles
+                    WHERE user_id ILIKE $1 OR email ILIKE $1
+                    ORDER BY user_id
+                    LIMIT $2 OFFSET $3
+                    """,
+                    f"%{q}%", limit, offset
+                )
+                total = await conn.fetchval(
+                    "SELECT COUNT(*) FROM user_profiles WHERE user_id ILIKE $1 OR email ILIKE $1",
+                    f"%{q}%"
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT user_id, email, gemini_apikey, created_at, updated_at FROM user_profiles ORDER BY user_id LIMIT $1 OFFSET $2",
+                    limit, offset
+                )
+                total = await conn.fetchval("SELECT COUNT(*) FROM user_profiles")
+            return {"items": [dict(r) for r in rows], "total": int(total)}
+    except Exception:
+        logger.exception('list_user_profiles failed')
+        raise
+
+
+async def delete_user_profile(user_id: str) -> bool:
+    try:
+        async with db_pool.get_connection() as conn:
+            result = await conn.execute("DELETE FROM user_profiles WHERE user_id=$1", user_id)
+            return result.upper().startswith('DELETE')
+    except Exception:
+        logger.exception('delete_user_profile failed')
+        raise
+
+
+# ----------------------------- Curations (admin) -----------------------------
+
+def _serialize_for_json(obj):
+    """Helper to serialize database row data for JSON storage, handling datetime objects."""
+    if isinstance(obj, dict):
+        return {k: _serialize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_serialize_for_json(item) for item in obj]
+    elif isinstance(obj, datetime):
+        return obj.isoformat() if obj else None
+    elif obj is None or obj == '':
+        return None
+    else:
+        return obj
+
+
+async def upsert_cve_curation(cve_id: str, data: Dict[str, Any], actor: Optional[str]) -> Dict[str, Any]:
+    _require_asyncpg()
+    async with db_pool.get_connection() as conn:
+        # Ensure the editorial tables exist (in case startup background ensure hasn't completed)
+        try:
+            exists = await conn.fetchval("SELECT to_regclass('public.cve_curations') IS NOT NULL")
+            if not exists:
+                try:
+                    await ensure_editorial_structure()
+                except Exception:
+                    logger.exception('ensure_editorial_structure failed during upsert')
+        except Exception:
+            # If the check itself fails, try to ensure structure once
+            try:
+                await ensure_editorial_structure()
+            except Exception:
+                logger.exception('ensure_editorial_structure failed during upsert (fallback)')
+        # Snapshot current for versioning
+        cur = await conn.fetchrow("SELECT * FROM cve_curations WHERE cve_id=$1", cve_id)
+        if cur:
+            # Compute next version
+            ver_no = (await conn.fetchval("SELECT COALESCE(MAX(version_no),0)+1 FROM cve_curation_versions WHERE cve_id=$1", cve_id)) or 1
+            try:
+                # Serialize the snapshot data, converting datetime objects and handling nulls
+                snapshot_data = _serialize_for_json(dict(cur))
+                
+                await conn.execute(
+                    "INSERT INTO cve_curation_versions(cve_id, version_no, snapshot, edited_by) VALUES ($1,$2,$3,$4)",
+                    cve_id, int(ver_no), json.dumps(snapshot_data), actor
+                )
+            except Exception:
+                logger.exception('Failed to insert curation version for %s', cve_id)
+
+        # Back-compat: 'status' kept but primary is 'curation_status'
+        curation_status = (
+            data.get('curation_status')
+            or data.get('status')
+            or (cur['curation_status'] if cur and 'curation_status' in cur else (cur['status'] if cur else 'draft'))
+        )
+        source_status = data.get('source_status') or (cur['source_status'] if cur and 'source_status' in cur else None)
+        status = data.get('status') or (cur['status'] if cur else curation_status)
+        title = data.get('title')
+        summary = data.get('summary')
+        body_md = data.get('body_md')
+        tags = json.dumps(data.get('tags') or [])
+        refs = json.dumps(data.get('references') or [])
+        extras = json.dumps(data.get('extras') or {})
+        public_extras = json.dumps(data.get('public_extras') or {})
+        curated_patch = json.dumps(data.get('curated_patch') or {})
+
+        # Normalize and validate statuses to satisfy DB CHECK constraints
+        allowed_status = { 'draft', 'review', 'published', 'archived' }
+        if curation_status:
+            curation_status = str(curation_status).lower()
+        else:
+            curation_status = 'draft'
+        if curation_status not in allowed_status:
+            raise ValueError(f"Invalid curation_status: {curation_status}")
+
+        if status:
+            status = str(status).lower()
+        else:
+            status = curation_status
+        if status not in allowed_status:
+            raise ValueError(f"Invalid status: {status}")
+
+        row = await conn.fetchrow(
+            """
+            INSERT INTO cve_curations (cve_id, status, curation_status, source_status, title, summary, body_md, tags, "references", curated_patch, extras, public_extras, created_by, updated_by, created_at, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,$12::jsonb,$13,$13, now(), now())
+            ON CONFLICT (cve_id) DO UPDATE SET
+                status=EXCLUDED.status,
+                curation_status=EXCLUDED.curation_status,
+                source_status=EXCLUDED.source_status,
+                title=EXCLUDED.title,
+                summary=EXCLUDED.summary,
+                body_md=EXCLUDED.body_md,
+                tags=EXCLUDED.tags,
+                "references"=EXCLUDED."references",
+                curated_patch=EXCLUDED.curated_patch,
+                extras=EXCLUDED.extras,
+                public_extras=EXCLUDED.public_extras,
+                updated_by=EXCLUDED.updated_by,
+                updated_at=now()
+            RETURNING *
+            """,
+            cve_id, status, curation_status, source_status, title, summary, body_md, tags, refs, curated_patch, extras, public_extras, actor
+        )
+        return dict(row)
+
+
+async def get_curation(cve_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        async with db_pool.get_connection() as conn:
+            row = await conn.fetchrow("SELECT * FROM cve_curations WHERE cve_id=$1", cve_id)
+            return dict(row) if row else None
+    except Exception:
+        logger.exception('get_curation failed for %s', cve_id)
+        return None
+
+
+async def list_curations(status: Optional[str], q: Optional[str], limit: int, offset: int) -> Dict[str, Any]:
+    clauses = []
+    params = []
+    if status:
+        params.append(status)
+        # Prefer curation_status, fallback to status for older rows
+        clauses.append(f"COALESCE(curation_status, status) = ${len(params)}")
+    if q:
+        params.append(f"%{q.lower()}%")
+        clauses.append(f"(lower(title) LIKE ${len(params)} OR lower(summary) LIKE ${len(params)} OR lower(cve_id) LIKE ${len(params)})")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    lim_idx = len(params) + 1
+    off_idx = len(params) + 2
+    sql = f"SELECT * FROM cve_curations {where} ORDER BY updated_at DESC LIMIT ${lim_idx} OFFSET ${off_idx}"
+    cnt_sql = f"SELECT COUNT(*) FROM cve_curations {where}"
+    try:
+        async with db_pool.get_connection() as conn:
+            rows = await conn.fetch(sql, *params, limit, offset)
+            total = await conn.fetchval(cnt_sql, *params)
+            return { 'items': [dict(r) for r in rows], 'total': int(total or 0) }
+    except Exception:
+        logger.exception('list_curations failed')
+        return { 'items': [], 'total': 0 }
+
+
+async def set_curation_publish_state(cve_id: str, publish: bool, actor: Optional[str]) -> bool:
+    try:
+        async with db_pool.get_connection() as conn:
+            if publish:
+                row = await conn.fetchrow(
+                    "UPDATE cve_curations SET curation_status='published', status='published', published_at=now(), updated_at=now(), updated_by=$2 WHERE cve_id=$1 RETURNING cve_id",
+                    cve_id, actor
+                )
+                if row:
+                    await conn.execute(
+                        "INSERT INTO publish_events(content_type, ref_id, action, actor) VALUES ('curation',$1,'publish',$2)",
+                        cve_id, actor
+                    )
+                return bool(row)
+            else:
+                row = await conn.fetchrow(
+                    "UPDATE cve_curations SET curation_status='archived', status='archived', updated_at=now(), updated_by=$2 WHERE cve_id=$1 RETURNING cve_id",
+                    cve_id, actor
+                )
+                if row:
+                    await conn.execute(
+                        "INSERT INTO publish_events(content_type, ref_id, action, actor) VALUES ('curation',$1,'unpublish',$2)",
+                        cve_id, actor
+                    )
+                return bool(row)
+    except Exception:
+        logger.exception('set_curation_publish_state failed for %s', cve_id)
+        return False
+
+
+async def delete_curation(cve_id: str, actor: Optional[str]) -> bool:
+    """Delete a curation and its version history."""
+    try:
+        async with db_pool.get_connection() as conn:
+            # Check if curation exists
+            exists = await conn.fetchval("SELECT 1 FROM cve_curations WHERE cve_id=$1", cve_id)
+            if not exists:
+                return False
+            
+            # Delete version history first (foreign key constraint)
+            await conn.execute("DELETE FROM cve_curation_versions WHERE cve_id=$1", cve_id)
+            
+            # Delete the curation
+            row = await conn.fetchrow("DELETE FROM cve_curations WHERE cve_id=$1 RETURNING cve_id", cve_id)
+            
+            if row:
+                # Log the deletion event
+                await conn.execute(
+                    "INSERT INTO publish_events(content_type, ref_id, action, actor) VALUES ('curation',$1,'delete',$2)",
+                    cve_id, actor
+                )
+                return True
+            return False
+    except Exception:
+        logger.exception('delete_curation failed for %s', cve_id)
+        return False
+
+
+# ------------------------------- Alerts (admin) ------------------------------
+
+async def create_alert(data: Dict[str, Any], actor: Optional[str]) -> Dict[str, Any]:
+    _require_asyncpg()
+    alert_id = data.get('id') or str(uuid.uuid4())
+    slug = data.get('slug')
+    status = (data.get('status') or 'draft').lower()
+    title = data.get('title')
+    body_md = data.get('body_md')
+    severity = (data.get('severity') or '').lower() or None
+    categories = json.dumps(data.get('categories') or [])
+    refs = json.dumps(data.get('references') or [])
+    extras = json.dumps(data.get('extras') or {})
+    public_extras = json.dumps(data.get('public_extras') or {})
+    async with db_pool.get_connection() as conn:
+        # Ensure alerts table exists
+        try:
+            exists = await conn.fetchval("SELECT to_regclass('public.alerts') IS NOT NULL")
+            if not exists:
+                try:
+                    await ensure_editorial_structure()
+                except Exception:
+                    logger.exception('ensure_editorial_structure failed during create_alert')
+        except Exception:
+            try:
+                await ensure_editorial_structure()
+            except Exception:
+                logger.exception('ensure_editorial_structure failed during create_alert (fallback)')
+        row = await conn.fetchrow(
+            """
+            INSERT INTO alerts (id, slug, status, title, body_md, severity, categories, "references", extras, public_extras, created_by, updated_by, created_at, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,$11,$11, now(), now())
+            RETURNING *
+            """,
+            uuid.UUID(alert_id), slug, status, title, body_md, severity, categories, refs, extras, public_extras, actor
+        )
+        return dict(row)
+
+
+async def update_alert(id_or_slug: str, data: Dict[str, Any], actor: Optional[str]) -> Optional[Dict[str, Any]]:
+    fields = []
+    params: List[Any] = []
+    for key in ('title','body_md','severity'):
+        if key in data:
+            val = data[key]
+            if key in ('severity','status') and isinstance(val, str):
+                val = val.lower()
+            params.append(val)
+            fields.append(f"{key} = ${len(params)}")
+    if 'categories' in data:
+        params.append(json.dumps(data['categories']))
+        fields.append(f"categories = ${len(params)}::jsonb")
+    if 'references' in data:
+        params.append(json.dumps(data['references']))
+        fields.append(f"\"references\" = ${len(params)}::jsonb")
+    if 'extras' in data:
+        params.append(json.dumps(data['extras']))
+        fields.append(f"extras = ${len(params)}::jsonb")
+    if 'public_extras' in data:
+        params.append(json.dumps(data['public_extras']))
+        fields.append(f"public_extras = ${len(params)}::jsonb")
+    params.append(actor)
+    fields.append(f"updated_by = ${len(params)}")
+    set_sql = ", ".join(fields) + ", updated_at = now()"
+    # Identify by UUID or slug
+    cond_sql = "id = $%d" % (len(params)+1)
+    try:
+        uid = uuid.UUID(id_or_slug)
+        lookup_val: Any = uid
+    except Exception:
+        cond_sql = "slug = $%d" % (len(params)+1)
+        lookup_val = id_or_slug
+    params.append(lookup_val)
+    sql = f"UPDATE alerts SET {set_sql} WHERE {cond_sql} RETURNING *"
+    try:
+        async with db_pool.get_connection() as conn:
+            row = await conn.fetchrow(sql, *params)
+            return dict(row) if row else None
+    except Exception:
+        logger.exception('update_alert failed')
+        return None
+
+
+async def get_alert_by_id_or_slug(id_or_slug: str) -> Optional[Dict[str, Any]]:
+    try:
+        async with db_pool.get_connection() as conn:
+            row = None
+            try:
+                row = await conn.fetchrow("SELECT * FROM alerts WHERE id=$1", uuid.UUID(id_or_slug))
+            except Exception:
+                row = await conn.fetchrow("SELECT * FROM alerts WHERE slug=$1", id_or_slug)
+            return dict(row) if row else None
+    except Exception:
+        logger.exception('get_alert failed')
+        return None
+
+
+async def list_alerts_admin(status: Optional[str], q: Optional[str], limit: int, offset: int) -> Dict[str, Any]:
+    clauses = []
+    params: List[Any] = []
+    if status:
+        params.append(status)
+        clauses.append(f"status = ${len(params)}")
+    if q:
+        params.append(f"%{q.lower()}%")
+        clauses.append(f"(lower(title) LIKE ${len(params)} OR lower(body_md) LIKE ${len(params)} OR lower(slug) LIKE ${len(params)})")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    lim_idx = len(params) + 1
+    off_idx = len(params) + 2
+    sql = f"SELECT * FROM alerts {where} ORDER BY updated_at DESC LIMIT ${lim_idx} OFFSET ${off_idx}"
+    cnt_sql = f"SELECT COUNT(*) FROM alerts {where}"
+    try:
+        async with db_pool.get_connection() as conn:
+            rows = await conn.fetch(sql, *params, limit, offset)
+            total = await conn.fetchval(cnt_sql, *params)
+            return { 'items': [dict(r) for r in rows], 'total': int(total or 0) }
+    except Exception:
+        logger.exception('list_alerts_admin failed')
+        return { 'items': [], 'total': 0 }
+
+
+async def set_alert_publish_state(id_or_slug: str, publish: bool, actor: Optional[str]) -> bool:
+    try:
+        async with db_pool.get_connection() as conn:
+            # Determine key
+            cond_sql = "id = $2"
+            try:
+                key_val = uuid.UUID(id_or_slug)
+            except Exception:
+                cond_sql = "slug = $2"
+                key_val = id_or_slug
+            if publish:
+                row = await conn.fetchrow(
+                    f"UPDATE alerts SET status='published', published_at=now(), updated_at=now(), updated_by=$1 WHERE {cond_sql} RETURNING id",
+                    actor, key_val
+                )
+                if row:
+                    await conn.execute("INSERT INTO publish_events(content_type, ref_id, action, actor) VALUES ('alert',$1,'publish',$2)", str(key_val), actor)
+                return bool(row)
+            else:
+                row = await conn.fetchrow(
+                    f"UPDATE alerts SET status='archived', updated_at=now(), updated_by=$1 WHERE {cond_sql} RETURNING id",
+                    actor, key_val
+                )
+                if row:
+                    await conn.execute("INSERT INTO publish_events(content_type, ref_id, action, actor) VALUES ('alert',$1,'unpublish',$2)", str(key_val), actor)
+                return bool(row)
+    except Exception:
+        logger.exception('set_alert_publish_state failed')
+        return False
+
+
+async def delete_alert(id_or_slug: str, actor: Optional[str]) -> bool:
+    """Delete an alert by ID or slug."""
+    try:
+        async with db_pool.get_connection() as conn:
+            # Try to identify by UUID first
+            cond_sql = "id = $1"
+            try:
+                lookup_val = uuid.UUID(id_or_slug)
+            except Exception:
+                cond_sql = "slug = $1"
+                lookup_val = id_or_slug
+            
+            # Delete the alert
+            row = await conn.fetchrow(f"DELETE FROM alerts WHERE {cond_sql} RETURNING id, slug", lookup_val)
+            
+            if row:
+                # Log the deletion event using the ID for consistency
+                alert_id = str(row['id'])
+                await conn.execute(
+                    "INSERT INTO publish_events(content_type, ref_id, action, actor) VALUES ('alert',$1,'delete',$2)",
+                    alert_id, actor
+                )
+                return True
+            return False
+    except Exception:
+        logger.exception('delete_alert failed for %s', id_or_slug)
+        return False
+
+
+# ------------------------------- Public (read) -------------------------------
+
+async def public_get_alert_by_slug(slug: str) -> Optional[Dict[str, Any]]:
+    try:
+        async with db_pool.get_connection() as conn:
+            row = await conn.fetchrow("SELECT * FROM alerts_public WHERE slug=$1", slug)
+            return dict(row) if row else None
+    except Exception:
+        logger.exception('public_get_alert_by_slug failed')
+        return None
+
+
+async def public_list_alerts(q: Optional[str], severity: Optional[str], category: Optional[str], limit: int, offset: int) -> Dict[str, Any]:
+    clauses = []
+    params: List[Any] = []
+    if q:
+        params.append(f"%{q.lower()}%")
+        clauses.append(f"(lower(title) LIKE ${len(params)} OR lower(body_md) LIKE ${len(params)} OR lower(slug) LIKE ${len(params)})")
+    if severity:
+        params.append(severity.lower())
+        clauses.append(f"severity = ${len(params)}")
+    if category:
+        params.append(category)
+        # Use jsonb containment for exact text match within categories array
+        clauses.append(f"categories @> jsonb_build_array(${len(params)})")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    # Embed validated integers for LIMIT/OFFSET to avoid placeholder parsing issues
+    safe_limit = int(limit)
+    safe_offset = int(offset)
+    sql = f"SELECT * FROM alerts_public {where} ORDER BY published_at DESC NULLS LAST LIMIT {safe_limit} OFFSET {safe_offset}"
+    cnt_sql = f"SELECT COUNT(*) FROM alerts_public {where}"
+    try:
+        async with db_pool.get_connection() as conn:
+            rows = await conn.fetch(sql, *params)
+            total = await conn.fetchval(cnt_sql, *params)
+            return { 'items': [dict(r) for r in rows], 'total': int(total or 0) }
+    except Exception:
+        logger.exception('public_list_alerts failed')
+        return { 'items': [], 'total': 0 }
+
+
+async def public_get_curated_cve(cve_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        async with db_pool.get_connection() as conn:
+            # Get curated metadata and CVSS from public overview
+            curated_row = await conn.fetchrow("SELECT * FROM cve_public_overview WHERE cve_id=$1", cve_id)
+            if not curated_row:
+                return None
+            
+            # Get original NVD data and overview metadata
+            original_row = await conn.fetchrow("SELECT * FROM cve_overview WHERE cve_id=$1", cve_id)
+            nvd_row = await conn.fetchrow("SELECT data FROM nvd_cves WHERE cve_id=$1", cve_id)
+            
+            # Get curation details including curated_patch - only published for public API
+            curation_row = await conn.fetchrow(
+                "SELECT curated_patch, extras, public_extras FROM cve_curations WHERE cve_id=$1 AND COALESCE(curation_status, status) = 'published'", 
+                cve_id
+            )
+            
+            result = dict(curated_row)
+            
+            # Include original NVD data structure if available
+            if nvd_row and nvd_row.get('data'):
+                original_data = nvd_row['data']
+                if isinstance(original_data, str):
+                    import json
+                    original_data = json.loads(original_data)
+                result['original_data'] = original_data
+            
+            # Include overview metadata
+            if original_row:
+                overview_data = dict(original_row)
+                result['source'] = overview_data.get('source')
+                result['last_modified'] = overview_data.get('last_modified')
+                result['table_source'] = overview_data.get('table_source')
+                result['table_sources'] = overview_data.get('table_sources')
+                result['description'] = overview_data.get('description')
+                
+                # KEV data if available
+                if overview_data.get('is_kev'):
+                    result['kev_date_added'] = overview_data.get('kev_date_added')
+                    result['kev_required_action'] = overview_data.get('kev_required_action')
+                    result['kev_due_date'] = overview_data.get('kev_due_date')
+            
+            # Apply curated overrides if available
+            if curation_row and curation_row.get('curated_patch'):
+                curated_patch = curation_row['curated_patch']
+                if isinstance(curated_patch, str):
+                    import json
+                    curated_patch = json.loads(curated_patch)
+                
+                # Apply JSON Merge Patch logic to original_data
+                if curated_patch and result.get('original_data'):
+                    result['curated_data'] = _apply_json_merge_patch(result['original_data'], curated_patch)
+                else:
+                    result['curated_data'] = result.get('original_data', {})
+            else:
+                result['curated_data'] = result.get('original_data', {})
+            
+            return result
+            
+    except Exception:
+        logger.exception('public_get_curated_cve failed')
+        return None
+
+
+async def admin_get_curated_cve(cve_id: str) -> Optional[Dict[str, Any]]:
+    """Get comprehensive CVE data for admin/editorial purposes, including draft curations and all metadata."""
+    try:
+        async with db_pool.get_connection() as conn:
+            # Get base curation data (any status)
+            curation_row = await conn.fetchrow("SELECT * FROM cve_curations WHERE cve_id=$1", cve_id)
+            
+            # Get original NVD data and overview metadata
+            original_row = await conn.fetchrow("SELECT * FROM cve_overview WHERE cve_id=$1", cve_id)
+            nvd_row = await conn.fetchrow("SELECT data FROM nvd_cves WHERE cve_id=$1", cve_id)
+            
+            # Start with curation data if available, otherwise create minimal structure
+            if curation_row:
+                result = dict(curation_row)
+            else:
+                # No curation exists yet - create minimal structure
+                result = {
+                    'cve_id': cve_id,
+                    'title': None,
+                    'summary': None,
+                    'body_md': None,
+                    'tags': [],
+                    'references': [],
+                    'curation_status': None,
+                    'source_status': None,
+                    'status': None,
+                    'curated_patch': {},
+                    'extras': {},
+                    'public_extras': {},
+                    'created_by': None,
+                    'updated_by': None,
+                    'created_at': None,
+                    'updated_at': None,
+                    'published_at': None
+                }
+            
+            # Include original NVD data structure if available
+            if nvd_row and nvd_row.get('data'):
+                original_data = nvd_row['data']
+                if isinstance(original_data, str):
+                    import json
+                    original_data = json.loads(original_data)
+                result['original_data'] = original_data
+            
+            # Include overview metadata
+            if original_row:
+                overview_data = dict(original_row)
+                result['source'] = overview_data.get('source')
+                result['last_modified'] = overview_data.get('last_modified')
+                result['table_source'] = overview_data.get('table_source')
+                result['table_sources'] = overview_data.get('table_sources')
+                result['description'] = overview_data.get('description')
+                
+                # KEV data if available
+                if overview_data.get('is_kev'):
+                    result['kev_date_added'] = overview_data.get('kev_date_added')
+                    result['kev_required_action'] = overview_data.get('kev_required_action')
+                    result['kev_due_date'] = overview_data.get('kev_due_date')
+            
+            # Apply curated overrides if available
+            if curation_row and curation_row.get('curated_patch'):
+                curated_patch = curation_row['curated_patch']
+                if isinstance(curated_patch, str):
+                    import json
+                    curated_patch = json.loads(curated_patch)
+                
+                # Apply JSON Merge Patch logic to original_data
+                if curated_patch and result.get('original_data'):
+                    result['curated_data'] = _apply_json_merge_patch(result['original_data'], curated_patch)
+                else:
+                    result['curated_data'] = result.get('original_data', {})
+            else:
+                result['curated_data'] = result.get('original_data', {})
+            
+            return result
+            
+    except Exception:
+        logger.exception('admin_get_curated_cve failed')
+        return None
+
+
+def _apply_json_merge_patch(target: dict, patch: dict) -> dict:
+    """Apply JSON Merge Patch (RFC 7396) to merge curated overrides with original data."""
+    if not isinstance(patch, dict):
+        return patch
+    
+    result = target.copy() if isinstance(target, dict) else {}
+    
+    for key, value in patch.items():
+        if value is None:
+            # Remove the key
+            result.pop(key, None)
+        elif isinstance(value, dict) and key in result and isinstance(result[key], dict):
+            # Recursive merge for nested objects
+            result[key] = _apply_json_merge_patch(result[key], value)
+        else:
+            # Replace or add the value
+            result[key] = value
+    
+    return result
+
+
+async def public_list_cves(q: Optional[str], severity: Optional[str], has_kev: Optional[bool], tag: Optional[str], limit: int, offset: int) -> Dict[str, Any]:
+    clauses = []
+    params: List[Any] = []
+    if q:
+        params.append(f"%{q.lower()}%")
+        clauses.append(f"(lower(curated_title) LIKE ${len(params)} OR lower(curated_summary) LIKE ${len(params)} OR lower(cve_id) LIKE ${len(params)})")
+    if severity:
+        params.append(severity.upper())
+        # Use unified severity if available; fallback to v3.1 for deployments before migration
+        clauses.append(f"UPPER(COALESCE(cvss_severity, cvss_v31_severity)) = ${len(params)}")
+    if has_kev is not None:
+        params.append(has_kev)
+        clauses.append(f"is_kev = ${len(params)}")
+    if tag:
+        params.append(tag)
+        clauses.append(f"tags @> jsonb_build_array(${len(params)})")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    safe_limit = int(limit)
+    safe_offset = int(offset)
+    sql = f"SELECT * FROM cve_public_overview {where} ORDER BY published_at DESC NULLS LAST, cve_published DESC NULLS LAST LIMIT {safe_limit} OFFSET {safe_offset}"
+    cnt_sql = f"SELECT COUNT(*) FROM cve_public_overview {where}"
+    try:
+        async with db_pool.get_connection() as conn:
+            rows = await conn.fetch(sql, *params)
+            total = await conn.fetchval(cnt_sql, *params)
+            return { 'items': [dict(r) for r in rows], 'total': int(total or 0) }
+    except Exception:
+        logger.exception('public_list_cves failed')
+        return { 'items': [], 'total': 0 }
 
 
 async def store_nvd_cve(cve_id: str, published: datetime, last_modified: datetime, 
@@ -978,6 +2043,126 @@ async def get_database_stats() -> Dict[str, Any]:
             'nvd_cves_total': 0,
             'cisa_kevs_total': 0,
             'recent_cves_30_days': 0,
+            'last_updated': datetime.utcnow().isoformat()
+        }
+
+
+async def get_dashboard_stats() -> Dict[str, Any]:
+    """
+    Get comprehensive dashboard statistics including totals, severity distribution, and recent data.
+    
+    Returns:
+        Dict with dashboard metrics for frontend
+    """
+    try:
+        async with db_pool.get_connection() as conn:
+            # Basic counts
+            total_cves = await conn.fetchval("SELECT COUNT(*) FROM cve_overview")
+            total_curations = await conn.fetchval("SELECT COUNT(*) FROM cve_curations")
+            total_alerts = await conn.fetchval("SELECT COUNT(*) FROM alerts")
+            
+            # Published counts
+            published_curations = await conn.fetchval(
+                "SELECT COUNT(*) FROM cve_curations WHERE COALESCE(curation_status, status) = 'published'"
+            )
+            published_alerts = await conn.fetchval(
+                "SELECT COUNT(*) FROM alerts WHERE status = 'published'"
+            )
+            
+            # Critical severity count from cve_overview (prefer v3.1, then v4.0, then v3.0)
+            critical_count = await conn.fetchval("""
+                SELECT COUNT(*) FROM cve_overview 
+                WHERE UPPER(COALESCE(cvss_v31_severity, cvss_v40_severity, cvss_v30_severity)) = 'CRITICAL'
+            """)
+            
+            # Severity distribution (only actual CVSS levels: LOW, MEDIUM, HIGH, CRITICAL) from cve_overview
+            severity_dist = await conn.fetch("""
+                WITH severity_data AS (
+                    SELECT UPPER(COALESCE(cvss_v31_severity, cvss_v40_severity, cvss_v30_severity)) AS severity
+                    FROM cve_overview
+                    WHERE COALESCE(cvss_v31_severity, cvss_v40_severity, cvss_v30_severity) IS NOT NULL
+                )
+                SELECT severity, COUNT(*) AS count
+                FROM severity_data
+                WHERE severity IN ('LOW','MEDIUM','HIGH','CRITICAL')
+                GROUP BY severity
+                ORDER BY 
+                    CASE severity
+                        WHEN 'LOW' THEN 1
+                        WHEN 'MEDIUM' THEN 2  
+                        WHEN 'HIGH' THEN 3
+                        WHEN 'CRITICAL' THEN 4
+                    END
+            """)
+            
+            # Recent CVEs (last 30 days) from cve_overview
+            recent_cves = await conn.fetch("""
+                SELECT 
+                    cve_id,
+                    description AS title,
+                    COALESCE(cvss_v31_severity, cvss_v40_severity, cvss_v30_severity) AS severity,
+                    published AS published_at,
+                    last_modified AS last_modified,
+                    is_kev
+                FROM cve_overview
+                WHERE published >= NOW() - INTERVAL '30 days'
+                ORDER BY published DESC
+                LIMIT 10
+            """)
+            
+            # Calculate total for percentage calculation
+            total_with_severity = sum(row['count'] for row in severity_dist)
+            
+            # Format severity distribution with percentages
+            severity_distribution = {}
+            for row in severity_dist:
+                severity = row['severity'].lower().title()
+                count = row['count']
+                percentage = (count / total_with_severity * 100) if total_with_severity > 0 else 0
+                severity_distribution[severity] = {
+                    'count': count,
+                    'percentage': round(percentage, 1)
+                }
+            
+            # Format recent CVEs
+            recent_cves_formatted = []
+            for row in recent_cves:
+                recent_cves_formatted.append({
+                    'cve_id': row['cve_id'],
+                    'title': row['title'],
+                    'severity': row['severity'],
+                    'published_at': row['published_at'].isoformat() if row['published_at'] else None,
+                    'last_modified': row['last_modified'].isoformat() if row['last_modified'] else None,
+                    'is_kev': row['is_kev']
+                })
+            
+            return {
+                'totals': {
+                    'cves': total_cves,
+                    'curations': total_curations,
+                    'published_curations': published_curations,
+                    'alerts': total_alerts,
+                    'published_alerts': published_alerts,
+                    'critical': critical_count
+                },
+                'severity_distribution': severity_distribution,
+                'recent_cves': recent_cves_formatted,
+                'last_updated': datetime.utcnow().replace(tzinfo=zoneinfo.ZoneInfo('UTC')).astimezone(TZINFO).isoformat()
+            }
+    
+    except Exception as e:
+        logger.exception('Error getting dashboard stats')
+        return {
+            'totals': {
+                'cves': 0,
+                'curations': 0,
+                'published_curations': 0,
+                'alerts': 0,
+                'published_alerts': 0,
+                'critical': 0
+            },
+            'severity_distribution': {},
+            'recent_cves': [],
             'last_updated': datetime.utcnow().isoformat()
         }
 
