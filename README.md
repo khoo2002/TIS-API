@@ -1,5 +1,9 @@
 # TIS-API (JSONB + Materialized View)
-<video controls src="Threat-Intel-api.mp4" title="Threat-Intel-api"></video>
+<!-- Video: place Threat-Intel-api.mp4 at the repo root or `docs/` -->
+<video controls src="./Threat-Intel-api.mp4" title="Threat-Intel-api" style="max-width:100%;height:auto;">
+  Your browser does not support the video tag. Download the video here:
+  <a href="./Threat-Intel-api.mp4">Threat-Intel-api.mp4</a>
+</video>
 A FastAPI service that ingests CVE data from multiple sources (NVD, CISA KEV) into PostgreSQL using a JSONB-first schema. A materialized view `cve_overview` provides a unified, query-friendly surface for fast search.
 
 Highlights
